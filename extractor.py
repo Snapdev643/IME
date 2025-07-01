@@ -3,6 +3,7 @@ import os
 import datetime
 import html
 import shutil
+import hashlib
 
 # --- CONFIG ---
 DB_PATH = input("Enter the path to your database file (usually starts with '3d0d7'): ").strip()
@@ -13,52 +14,55 @@ HTML_PATH = os.path.join(EXPORT_DIR, 'imessages.html')
 
 os.makedirs(ATTACHMENTS_DIR, exist_ok=True)
 
-# --- CONNECT TO DB ---
+# CONNECT TO DATABASE
 conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 
-# --- Lookup Tables ---
+# CHAT LOOKUP
 cursor.execute("""
-SELECT
-    c.ROWID as chat_id,
-    IFNULL(h.id, 'Unknown') as handle_id
+SELECT c.ROWID as chat_id, IFNULL(h.id, 'Unknown') as handle_id
 FROM chat c
 LEFT JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
 LEFT JOIN handle h ON h.ROWID = chj.handle_id
 """)
 chat_lookup = {row[0]: row[1] for row in cursor.fetchall()}
 
-# --- Attachments Mapping ---
+# ATTACHMENTS
 cursor.execute("""
-SELECT
-    ma.message_id,
-    a.filename,
-    a.mime_type,
-    a.transfer_name,
-    a.guid
+SELECT ma.message_id, a.guid, a.mime_type, a.transfer_name
 FROM message_attachment_join ma
 JOIN attachment a ON a.ROWID = ma.attachment_id
 """)
 attachments_map = {}
-for msg_id, filename, mime, name, guid in cursor.fetchall():
+for msg_id, guid, mime, name in cursor.fetchall():
     if msg_id not in attachments_map:
         attachments_map[msg_id] = []
-    attachments_map[msg_id].append({
-        "filename": filename,
-        "mime_type": mime,
-        "name": name,
-        "guid": guid
-    })
 
-# --- Messages ---
+    sha1 = hashlib.sha1(guid.encode('utf-8')).hexdigest()
+    file_path = os.path.join(BACKUP_DIR, sha1[:2], sha1)
+
+    if os.path.exists(file_path):
+        dest_path = os.path.join(ATTACHMENTS_DIR, sha1)
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        try:
+            shutil.copy2(file_path, dest_path)
+            attachments_map[msg_id].append({
+                "path": os.path.relpath(dest_path, EXPORT_DIR).replace("\\", "/"),
+                "mime_type": mime,
+                "name": name or "(Attachment)"
+            })
+        except Exception as e:
+            print(f"Failed to copy: {file_path} -> {e}")
+    else:
+        attachments_map[msg_id].append({
+            "path": None,
+            "mime_type": mime,
+            "name": name or "(Attachment)"
+        })
+
+# FETCH MESSAGES
 cursor.execute("""
-SELECT
-    m.ROWID,
-    m.date,
-    m.is_from_me,
-    m.text,
-    cmj.chat_id,
-    h.id as handle_id
+SELECT m.ROWID, m.date, m.is_from_me, m.text, cmj.chat_id, h.id as handle_id
 FROM message m
 LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
 LEFT JOIN handle h ON h.ROWID = m.handle_id
@@ -72,9 +76,9 @@ conversations = {}
 
 for row in cursor.fetchall():
     msg_id, date, is_from_me, text, chat_id, handle_id = row
-    if chat_id is None:
-        chat_id = -1
-    contact = chat_lookup.get(chat_id, handle_id or 'Unknown')
+    chat_id = chat_id if chat_id is not None else -1
+    contact = chat_lookup.get(chat_id, handle_id or 'Unknown') or 'Unknown'
+
     if contact not in conversations:
         conversations[contact] = []
 
@@ -84,34 +88,21 @@ for row in cursor.fetchall():
     except:
         timestamp = str(date)
 
-    text = (text or "").replace("[OBJ]", "(Attachment)")
+    text = (text or "").replace("￼", "(Attachment)") #3:39 AM: Bruh
     text = html.escape(text)
 
-    # Add attachments if any
-    imgs = []
-    for att in attachments_map.get(msg_id, []):
-        if att["filename"]:
-            relative_path = att["filename"]
-            src_path = os.path.join(BACKUP_DIR, relative_path[:2], relative_path)
-            dest_path = os.path.join(ATTACHMENTS_DIR, relative_path)
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            try:
-                shutil.copy2(src_path, dest_path)
-                imgs.append(os.path.relpath(dest_path, EXPORT_DIR).replace("\\", "/"))
-            except:
-                pass  # File might be missing from backup
+    attachments = attachments_map.get(msg_id, [])
 
     conversations[contact].append({
         "from_me": bool(is_from_me),
         "text": text,
         "timestamp": timestamp,
-        "images": imgs
+        "attachments": attachments
     })
 
-# --- HTML TEMPLATE SETUP ---
-html_sections = []
+# GENERATE HTML
 tabs_html = ""
-content_html = ""
+chat_sections = ""
 
 for idx, (contact, messages) in enumerate(conversations.items()):
     contact_id = f"tab{idx}"
@@ -124,16 +115,17 @@ for idx, (contact, messages) in enumerate(conversations.items()):
         timestamp_html = f'<div class="timestamp">{msg["timestamp"]}</div>'
 
         image_html = ""
-        for img_path in msg["images"]:
-            if img_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif')):
-                image_html += f'<div class="image"><img src="{img_path}" alt="image" /></div>'
+        for att in msg["attachments"]:
+            if att["path"] and att["mime_type"].startswith("image/"):
+                image_html += f'<div class="image"><img src="{att["path"]}" alt="{att["name"]}" /></div>'
+            elif not msg["text"].strip():
+                image_html += f'<div class="image">(Attachment)</div>'
 
         section += f'<div class="container">{bubble_html}{image_html}{timestamp_html}</div>\n'
 
     section += '</div>'
-    html_sections.append(section)
+    chat_sections += section
 
-# --- FINAL HTML ---
 html_template = f"""
 <!DOCTYPE html>
 <html>
@@ -220,7 +212,7 @@ body {{
 {tabs_html}
 </div>
 
-{''.join(html_sections)}
+{chat_sections}
 
 <script>
 function openTab(evt, tabId) {{
@@ -245,7 +237,6 @@ document.addEventListener("DOMContentLoaded", function() {{
 </html>
 """
 
-# --- WRITE HTML FILE ---
 os.makedirs(EXPORT_DIR, exist_ok=True)
 with open(HTML_PATH, 'w', encoding='utf-8') as f:
     f.write(html_template)

@@ -2,6 +2,8 @@
 
 An iMessage exporter. I made this cause I was pissed off because all of the tools I tried to use either didn't work or were paid.
 
+I can't get the attachments to work for some reason.
+
 ## How to use
 
 1. Create a backup with iTunes
